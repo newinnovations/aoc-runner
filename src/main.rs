@@ -41,7 +41,7 @@ enum Input {
 #[derive(Debug)]
 enum AppEvent {
     FileChanged,
-    OutputLine(String),
+    OutputLine(Color, String),
     ProcessFinished,
     Tick,
 }
@@ -51,7 +51,7 @@ struct AppState {
     day: u32,
     part: Part,
     input: Input,
-    output_lines: Vec<String>,
+    output_lines: Vec<(Color, String)>,
     scroll_offset: usize,
     horizontal_scroll: usize,
     viewport_height: usize,
@@ -118,14 +118,14 @@ impl AppState {
         }
     }
 
-    fn add_output_line(&mut self, line: String) {
+    fn add_output_line(&mut self, color: Color, line: String) {
         let truncated = if line.len() > MAX_LINE_LENGTH {
             line.chars().take(MAX_LINE_LENGTH).collect()
         } else {
             line
         };
 
-        self.output_lines.push(truncated);
+        self.output_lines.push((color, truncated));
         if self.output_lines.len() > MAX_LINES {
             self.output_lines.remove(0);
             if self.scroll_offset > 0 {
@@ -239,19 +239,19 @@ async fn run_program(
     };
 
     if !prog_path.exists() {
-        tx.send(AppEvent::OutputLine(format!(
-            "Error: Program '{}' not found",
-            prog_path.display()
-        )))?;
+        tx.send(AppEvent::OutputLine(
+            Color::LightRed,
+            format!("Error: Program '{}' not found", prog_path.display()),
+        ))?;
         tx.send(AppEvent::ProcessFinished)?;
         return Ok(());
     }
 
     if !input_path.exists() {
-        tx.send(AppEvent::OutputLine(format!(
-            "Error: Input file '{}' not found",
-            input_path.display()
-        )))?;
+        tx.send(AppEvent::OutputLine(
+            Color::LightRed,
+            format!("Error: Input file '{}' not found", input_path.display()),
+        ))?;
         tx.send(AppEvent::ProcessFinished)?;
         return Ok(());
     }
@@ -278,7 +278,7 @@ async fn run_program(
     let stdout_handle = tokio::spawn(async move {
         let reader = BufReader::new(stdout);
         for line in reader.lines().map_while(Result::ok) {
-            let _ = tx_stdout.send(AppEvent::OutputLine(line));
+            let _ = tx_stdout.send(AppEvent::OutputLine(Color::White, line));
         }
     });
 
@@ -286,7 +286,10 @@ async fn run_program(
     let stderr_handle = tokio::spawn(async move {
         let reader = BufReader::new(stderr);
         for line in reader.lines().map_while(Result::ok) {
-            let _ = tx_stderr.send(AppEvent::OutputLine(format!("ERROR: {}", line)));
+            let _ = tx_stderr.send(AppEvent::OutputLine(
+                Color::LightRed,
+                format!("ERROR: {}", line),
+            ));
         }
     });
 
@@ -317,8 +320,8 @@ async fn run_program(
                         .unwrap_or_else(|| "unknown".to_string())
                 )
             };
-            let _ = tx.send(AppEvent::OutputLine(String::new()));
-            let _ = tx.send(AppEvent::OutputLine(msg));
+            let _ = tx.send(AppEvent::OutputLine(Color::DarkGray, String::new()));
+            let _ = tx.send(AppEvent::OutputLine(Color::DarkGray, msg));
         }
         let _ = tx.send(AppEvent::ProcessFinished);
     });
@@ -346,11 +349,11 @@ fn render_ui(
         // Apply horizontal scrolling
         let visible_lines: Vec<Line> = state.output_lines[visible_start..visible_end]
             .iter()
-            .map(|line| {
+            .map(|(color, line)| {
                 let chars: Vec<char> = line.chars().collect();
                 let start = state.horizontal_scroll.min(chars.len());
                 let substring: String = chars[start..].iter().collect();
-                Line::from(substring)
+                Line::from(Span::styled(substring, Style::default().fg(*color)))
             })
             .collect();
 
@@ -416,18 +419,18 @@ fn render_ui(
                         }
                     }
                 },
-                Style::default().fg(Color::Green),
+                Style::default().fg(Color::Yellow),
             ),
             Span::raw(" | "),
             if state.running {
                 Span::styled(
                     "RUNNING",
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(Color::LightRed)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
-                Span::styled("STOPPED", Style::default().fg(Color::Gray))
+                Span::styled("STOPPED", Style::default().fg(Color::Green))
             },
             Span::raw(" | Time: "),
             Span::styled(
@@ -593,9 +596,9 @@ async fn main() -> Result<()> {
                         let _ = run_program(state_clone, tx_clone).await;
                     });
                 }
-                AppEvent::OutputLine(line) => {
+                AppEvent::OutputLine(color, line) => {
                     let mut state_guard = state.lock().unwrap();
-                    state_guard.add_output_line(line);
+                    state_guard.add_output_line(color, line);
                     let viewport_height = state_guard.viewport_height;
                     state_guard.scroll_to_bottom(viewport_height);
                 }
