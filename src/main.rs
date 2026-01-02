@@ -18,10 +18,10 @@ use std::{
     io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 const MAX_LINES: usize = 1000;
@@ -268,7 +268,7 @@ async fn run_program(
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let (prog_path, input_path) = {
-        let state = state.lock().unwrap();
+        let state = state.lock().await;
         (state.program_path(), state.input_path())
     };
 
@@ -308,7 +308,7 @@ async fn run_program(
     let stderr = child.stderr.take().unwrap();
 
     {
-        let mut state = state.lock().unwrap();
+        let mut state = state.lock().await;
         state.child_process = Some(child);
     }
 
@@ -356,7 +356,7 @@ async fn run_program(
         let _ = tokio::join!(stdout_handle, stderr_handle);
 
         let result = {
-            let mut state = state_clone.lock().unwrap();
+            let mut state = state_clone.lock().await;
             if let Some(child) = &mut state.child_process {
                 child.wait()
             } else {
@@ -550,25 +550,25 @@ async fn main() -> Result<()> {
     loop {
         if needs_render {
             let should_render = {
-                let state_guard = state.lock().unwrap();
+                let state_guard = state.lock().await;
                 state_guard.should_render()
             };
 
             if should_render {
-                let mut state_guard = state.lock().unwrap();
+                let mut state_guard = state.lock().await;
                 render_ui(&mut terminal, &mut state_guard)?;
                 needs_render = false;
             }
         }
 
         {
-            let state_guard = state.lock().unwrap();
+            let state_guard = state.lock().await;
             if state_guard.should_start_run() {
                 drop(state_guard);
 
                 let cancel_token = CancellationToken::new();
 
-                let mut state_guard = state.lock().unwrap();
+                let mut state_guard = state.lock().await;
                 state_guard.pending_restart = false;
                 state_guard.debounce_deadline = None;
                 state_guard.output_lines.clear();
@@ -592,7 +592,7 @@ async fn main() -> Result<()> {
         if event::poll(Duration::from_millis(10))?
             && let Event::Key(key) = event::read()?
         {
-            let mut state_guard = state.lock().unwrap();
+            let mut state_guard = state.lock().await;
 
             if state_guard.debounce_deadline.is_some()
                 && !matches!(key.code, KeyCode::Char('q') | KeyCode::Char('k'))
@@ -704,7 +704,7 @@ async fn main() -> Result<()> {
                     event_count += 1;
 
                     if batch.len() >= BATCH_SIZE {
-                        let mut state_guard = state.lock().unwrap();
+                        let mut state_guard = state.lock().await;
                         state_guard.add_output_lines_batch(batch);
                         let viewport_height = state_guard.viewport_height;
                         state_guard.scroll_to_bottom(viewport_height);
@@ -716,7 +716,7 @@ async fn main() -> Result<()> {
                 }
                 other_event => {
                     if !batch.is_empty() {
-                        let mut state_guard = state.lock().unwrap();
+                        let mut state_guard = state.lock().await;
                         state_guard.add_output_lines_batch(batch);
                         let viewport_height = state_guard.viewport_height;
                         state_guard.scroll_to_bottom(viewport_height);
@@ -727,7 +727,7 @@ async fn main() -> Result<()> {
 
                     match other_event {
                         AppEvent::FileChanged | AppEvent::UserTriggeredRun => {
-                            let mut state_guard = state.lock().unwrap();
+                            let mut state_guard = state.lock().await;
 
                             if state_guard.pending_restart {
                                 let deadline = Instant::now() + Duration::from_millis(DEBOUNCE_MS);
@@ -753,7 +753,7 @@ async fn main() -> Result<()> {
                         }
                         AppEvent::ProcessKilled => {}
                         AppEvent::ProcessFinished => {
-                            let mut state_guard = state.lock().unwrap();
+                            let mut state_guard = state.lock().await;
                             state_guard.running = false;
                             state_guard.end_time = Some(Instant::now());
                             state_guard.child_process = None;
@@ -773,7 +773,7 @@ async fn main() -> Result<()> {
         }
 
         if !batch.is_empty() {
-            let mut state_guard = state.lock().unwrap();
+            let mut state_guard = state.lock().await;
             state_guard.add_output_lines_batch(batch);
             let viewport_height = state_guard.viewport_height;
             state_guard.scroll_to_bottom(viewport_height);
@@ -782,7 +782,7 @@ async fn main() -> Result<()> {
     }
 
     {
-        let mut state_guard = state.lock().unwrap();
+        let mut state_guard = state.lock().await;
         state_guard.kill_process();
     }
 
