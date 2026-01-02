@@ -22,12 +22,14 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 const MAX_LINES: usize = 1000;
 const MAX_LINE_LENGTH: usize = 1000;
 const DEBOUNCE_MS: u64 = 100;
-const BATCH_SIZE: usize = 100; // Process up to 100 lines at once
-const MIN_RENDER_INTERVAL_MS: u64 = 16; // ~60 FPS max
+const BATCH_SIZE: usize = 100;
+const MIN_RENDER_INTERVAL_MS: u64 = 16;
+const CHANNEL_CAPACITY: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Part {
@@ -66,6 +68,7 @@ struct AppState {
     start_time: Option<Instant>,
     end_time: Option<Instant>,
     child_process: Option<Child>,
+    cancel_token: Option<CancellationToken>,
     last_render: Instant,
 }
 
@@ -86,6 +89,7 @@ impl AppState {
             start_time: None,
             end_time: None,
             child_process: None,
+            cancel_token: None,
             last_render: Instant::now(),
         }
     }
@@ -129,7 +133,6 @@ impl AppState {
         }
     }
 
-    // Batch add multiple lines efficiently
     fn add_output_lines_batch(&mut self, lines: Vec<(Color, String)>) {
         let mut truncated_lines: Vec<(Color, String)> = lines
             .into_iter()
@@ -145,7 +148,6 @@ impl AppState {
 
         self.output_lines.append(&mut truncated_lines);
 
-        // Trim excess lines
         if self.output_lines.len() > MAX_LINES {
             let excess = self.output_lines.len() - MAX_LINES;
             self.output_lines.drain(0..excess);
@@ -162,10 +164,15 @@ impl AppState {
     }
 
     fn kill_process(&mut self) {
+        if let Some(token) = self.cancel_token.take() {
+            token.cancel();
+        }
+
         if let Some(mut child) = self.child_process.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
+
         self.running = false;
         if self.start_time.is_some() && self.end_time.is_none() {
             self.end_time = Some(Instant::now());
@@ -204,7 +211,7 @@ fn parse_directory() -> Result<(u32, u32)> {
     Ok((year, day))
 }
 
-async fn watch_files(tx: mpsc::UnboundedSender<AppEvent>, year: u32, day: u32) -> Result<()> {
+async fn watch_files(tx: mpsc::Sender<AppEvent>, year: u32, day: u32) -> Result<()> {
     let (file_tx, mut file_rx) = mpsc::unbounded_channel();
 
     let file_tx_clone = file_tx.clone();
@@ -223,7 +230,6 @@ async fn watch_files(tx: mpsc::UnboundedSender<AppEvent>, year: u32, day: u32) -
         Config::default(),
     )?;
 
-    // Watch program files
     let prog_a = format!("aoc-{}-{}a.py", year, day);
     let prog_b = format!("aoc-{}-{}b.py", year, day);
 
@@ -234,7 +240,6 @@ async fn watch_files(tx: mpsc::UnboundedSender<AppEvent>, year: u32, day: u32) -
         watcher.watch(Path::new(&prog_b), RecursiveMode::NonRecursive)?;
     }
 
-    // Watch ref files (but not input.txt as it's a symlink)
     for i in 1..=9 {
         let ref_file = if i == 1 {
             "ref.txt".to_string()
@@ -248,8 +253,7 @@ async fn watch_files(tx: mpsc::UnboundedSender<AppEvent>, year: u32, day: u32) -
 
     tokio::spawn(async move {
         while (file_rx.recv().await).is_some() {
-            let _ = tx.send(AppEvent::FileChanged);
-            // Debounce: wait a bit to avoid multiple rapid triggers
+            let _ = tx.send(AppEvent::FileChanged).await;
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         drop(watcher);
@@ -260,7 +264,8 @@ async fn watch_files(tx: mpsc::UnboundedSender<AppEvent>, year: u32, day: u32) -
 
 async fn run_program(
     state: Arc<Mutex<AppState>>,
-    tx: mpsc::UnboundedSender<AppEvent>,
+    tx: mpsc::Sender<AppEvent>,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
     let (prog_path, input_path) = {
         let state = state.lock().unwrap();
@@ -268,20 +273,24 @@ async fn run_program(
     };
 
     if !prog_path.exists() {
-        tx.send(AppEvent::OutputLine(
-            Color::LightRed,
-            format!("Error: Program '{}' not found", prog_path.display()),
-        ))?;
-        tx.send(AppEvent::ProcessFinished)?;
+        let _ = tx
+            .send(AppEvent::OutputLine(
+                Color::LightRed,
+                format!("Error: Program '{}' not found", prog_path.display()),
+            ))
+            .await;
+        let _ = tx.send(AppEvent::ProcessFinished).await;
         return Ok(());
     }
 
     if !input_path.exists() {
-        tx.send(AppEvent::OutputLine(
-            Color::LightRed,
-            format!("Error: Input file '{}' not found", input_path.display()),
-        ))?;
-        tx.send(AppEvent::ProcessFinished)?;
+        let _ = tx
+            .send(AppEvent::OutputLine(
+                Color::LightRed,
+                format!("Error: Input file '{}' not found", input_path.display()),
+            ))
+            .await;
+        let _ = tx.send(AppEvent::ProcessFinished).await;
         return Ok(());
     }
 
@@ -304,30 +313,48 @@ async fn run_program(
     }
 
     let tx_stdout = tx.clone();
+    let cancel_stdout = cancel_token.clone();
     let stdout_handle = tokio::spawn(async move {
         let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            let _ = tx_stdout.send(AppEvent::OutputLine(Color::White, line));
+
+        for line in reader.lines() {
+            if cancel_stdout.is_cancelled() {
+                break;
+            }
+
+            if let Ok(line) = line {
+                let _ = tx_stdout.try_send(AppEvent::OutputLine(Color::White, line));
+            } else {
+                break;
+            }
         }
     });
 
     let tx_stderr = tx.clone();
+    let cancel_stderr = cancel_token.clone();
     let stderr_handle = tokio::spawn(async move {
         let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            let _ = tx_stderr.send(AppEvent::OutputLine(
-                Color::LightRed,
-                format!("ERROR: {}", line),
-            ));
+
+        for line in reader.lines() {
+            if cancel_stderr.is_cancelled() {
+                break;
+            }
+
+            if let Ok(line) = line {
+                let _ = tx_stderr.try_send(AppEvent::OutputLine(
+                    Color::LightRed,
+                    format!("ERROR: {}", line),
+                ));
+            } else {
+                break;
+            }
         }
     });
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        // Wait for stdout and stderr to finish reading
         let _ = tokio::join!(stdout_handle, stderr_handle);
 
-        // Then wait for process to exit
         let result = {
             let mut state = state_clone.lock().unwrap();
             if let Some(child) = &mut state.child_process {
@@ -349,10 +376,10 @@ async fn run_program(
                         .unwrap_or_else(|| "unknown".to_string())
                 )
             };
-            let _ = tx.send(AppEvent::OutputLine(Color::DarkGray, String::new()));
-            let _ = tx.send(AppEvent::OutputLine(Color::DarkGray, msg));
+            let _ = tx.try_send(AppEvent::OutputLine(Color::DarkGray, String::new()));
+            let _ = tx.try_send(AppEvent::OutputLine(Color::DarkGray, msg));
         }
-        let _ = tx.send(AppEvent::ProcessFinished);
+        let _ = tx.send(AppEvent::ProcessFinished).await;
     });
 
     Ok(())
@@ -368,14 +395,12 @@ fn render_ui(
             .constraints([Constraint::Min(3), Constraint::Length(3)])
             .split(f.area());
 
-        // Output area
         let output_height = chunks[0].height.saturating_sub(2) as usize;
         state.viewport_height = output_height;
 
         let visible_start = state.scroll_offset;
         let visible_end = (visible_start + output_height).min(state.output_lines.len());
 
-        // Apply horizontal scrolling
         let visible_lines: Vec<Line> = state.output_lines[visible_start..visible_end]
             .iter()
             .map(|(color, line)| {
@@ -401,7 +426,6 @@ fn render_ui(
         let output = Paragraph::new(visible_lines).block(output_block);
         f.render_widget(output, chunks[0]);
 
-        // Scrollbar
         if state.output_lines.len() > output_height {
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("↑"))
@@ -418,7 +442,6 @@ fn render_ui(
             );
         }
 
-        // Status bar
         let mut status_spans = vec![
             Span::styled(
                 format!("AoC {}/{} ", state.year, state.day),
@@ -502,35 +525,29 @@ async fn main() -> Result<()> {
     let (year, day) = parse_directory().context("Failed to parse directory structure")?;
 
     let state = Arc::new(Mutex::new(AppState::new(year, day)));
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
 
-    // Start file watcher
     watch_files(tx.clone(), year, day).await?;
 
-    // Set up terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Trigger initial run
-    let _ = tx.send(AppEvent::UserTriggeredRun);
+    let _ = tx.send(AppEvent::UserTriggeredRun).await;
 
-    // Tick timer for UI updates when running
     let tx_tick = tx.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let _ = tx_tick.send(AppEvent::Tick);
+            let _ = tx_tick.send(AppEvent::Tick).await;
         }
     });
 
     let mut needs_render = true;
 
-    // Main loop
     loop {
-        // Only render when needed and enough time has passed
         if needs_render {
             let should_render = {
                 let state_guard = state.lock().unwrap();
@@ -544,11 +561,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Check if we should start a run
         {
             let state_guard = state.lock().unwrap();
             if state_guard.should_start_run() {
                 drop(state_guard);
+
+                let cancel_token = CancellationToken::new();
 
                 let mut state_guard = state.lock().unwrap();
                 state_guard.pending_restart = false;
@@ -558,25 +576,24 @@ async fn main() -> Result<()> {
                 state_guard.running = true;
                 state_guard.start_time = Some(Instant::now());
                 state_guard.end_time = None;
+                state_guard.cancel_token = Some(cancel_token.clone());
                 drop(state_guard);
 
                 let state_clone = state.clone();
                 let tx_clone = tx.clone();
                 tokio::spawn(async move {
-                    let _ = run_program(state_clone, tx_clone).await;
+                    let _ = run_program(state_clone, tx_clone, cancel_token).await;
                 });
 
                 needs_render = true;
             }
         }
 
-        // Handle keyboard events
         if event::poll(Duration::from_millis(10))?
             && let Event::Key(key) = event::read()?
         {
             let mut state_guard = state.lock().unwrap();
 
-            // Ignore user input during debounce period
             if state_guard.debounce_deadline.is_some()
                 && !matches!(key.code, KeyCode::Char('q') | KeyCode::Char('k'))
             {
@@ -595,7 +612,7 @@ async fn main() -> Result<()> {
                     if state_guard.part != Part::A {
                         state_guard.part = Part::A;
                         drop(state_guard);
-                        let _ = tx.send(AppEvent::UserTriggeredRun);
+                        let _ = tx.send(AppEvent::UserTriggeredRun).await;
                         needs_render = true;
                     }
                 }
@@ -603,7 +620,7 @@ async fn main() -> Result<()> {
                     if state_guard.part != Part::B {
                         state_guard.part = Part::B;
                         drop(state_guard);
-                        let _ = tx.send(AppEvent::UserTriggeredRun);
+                        let _ = tx.send(AppEvent::UserTriggeredRun).await;
                         needs_render = true;
                     }
                 }
@@ -611,7 +628,7 @@ async fn main() -> Result<()> {
                     if state_guard.input != Input::Main {
                         state_guard.input = Input::Main;
                         drop(state_guard);
-                        let _ = tx.send(AppEvent::UserTriggeredRun);
+                        let _ = tx.send(AppEvent::UserTriggeredRun).await;
                         needs_render = true;
                     }
                 }
@@ -620,7 +637,7 @@ async fn main() -> Result<()> {
                     if state_guard.input != Input::Ref(n) {
                         state_guard.input = Input::Ref(n);
                         drop(state_guard);
-                        let _ = tx.send(AppEvent::UserTriggeredRun);
+                        let _ = tx.send(AppEvent::UserTriggeredRun).await;
                         needs_render = true;
                     }
                 }
@@ -677,7 +694,6 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Process async events in batches
         let mut batch = Vec::new();
         let mut event_count = 0;
 
@@ -687,7 +703,6 @@ async fn main() -> Result<()> {
                     batch.push((color, line));
                     event_count += 1;
 
-                    // Process batch when it gets large enough
                     if batch.len() >= BATCH_SIZE {
                         let mut state_guard = state.lock().unwrap();
                         state_guard.add_output_lines_batch(batch);
@@ -700,7 +715,6 @@ async fn main() -> Result<()> {
                     }
                 }
                 other_event => {
-                    // Process any remaining batch before handling other events
                     if !batch.is_empty() {
                         let mut state_guard = state.lock().unwrap();
                         state_guard.add_output_lines_batch(batch);
@@ -715,37 +729,29 @@ async fn main() -> Result<()> {
                         AppEvent::FileChanged | AppEvent::UserTriggeredRun => {
                             let mut state_guard = state.lock().unwrap();
 
-                            // If already pending, just reset the deadline
                             if state_guard.pending_restart {
                                 let deadline = Instant::now() + Duration::from_millis(DEBOUNCE_MS);
                                 state_guard.debounce_deadline = Some(deadline);
                                 continue;
                             }
 
-                            // Kill the current process if running
                             if state_guard.running {
                                 state_guard.kill_process();
                             }
 
-                            // Set up debounce period
                             let deadline = Instant::now() + Duration::from_millis(DEBOUNCE_MS);
                             state_guard.pending_restart = true;
                             state_guard.debounce_deadline = Some(deadline);
 
-                            // Spawn task to send ProcessKilled after the process is confirmed killed
                             let tx_clone = tx.clone();
                             tokio::spawn(async move {
-                                // Small delay to ensure kill completes
                                 tokio::time::sleep(Duration::from_millis(10)).await;
-                                let _ = tx_clone.send(AppEvent::ProcessKilled);
+                                let _ = tx_clone.send(AppEvent::ProcessKilled).await;
                             });
 
                             needs_render = true;
                         }
-                        AppEvent::ProcessKilled => {
-                            // Process has been killed, can now start if debounce is done
-                            // The main loop will check should_start_run()
-                        }
+                        AppEvent::ProcessKilled => {}
                         AppEvent::ProcessFinished => {
                             let mut state_guard = state.lock().unwrap();
                             state_guard.running = false;
@@ -761,13 +767,11 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Limit how many events we process in one iteration
             if event_count >= BATCH_SIZE * 2 {
                 break;
             }
         }
 
-        // Process any remaining batch
         if !batch.is_empty() {
             let mut state_guard = state.lock().unwrap();
             state_guard.add_output_lines_batch(batch);
@@ -777,7 +781,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Cleanup
     {
         let mut state_guard = state.lock().unwrap();
         state_guard.kill_process();
