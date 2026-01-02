@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 
 const MAX_LINES: usize = 1000;
 const MAX_LINE_LENGTH: usize = 1000;
+const DEBOUNCE_MS: u64 = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Part {
@@ -41,7 +42,9 @@ enum Input {
 #[derive(Debug)]
 enum AppEvent {
     FileChanged,
+    UserTriggeredRun,
     OutputLine(Color, String),
+    ProcessKilled,
     ProcessFinished,
     Tick,
 }
@@ -56,6 +59,8 @@ struct AppState {
     horizontal_scroll: usize,
     viewport_height: usize,
     running: bool,
+    pending_restart: bool,
+    debounce_deadline: Option<Instant>,
     start_time: Option<Instant>,
     end_time: Option<Instant>,
     child_process: Option<Child>,
@@ -73,6 +78,8 @@ impl AppState {
             horizontal_scroll: 0,
             viewport_height: 20,
             running: false,
+            pending_restart: false,
+            debounce_deadline: None,
             start_time: None,
             end_time: None,
             child_process: None,
@@ -152,6 +159,12 @@ impl AppState {
             self.end_time = Some(Instant::now());
         }
     }
+
+    fn should_start_run(&self) -> bool {
+        self.pending_restart
+            && !self.running
+            && self.debounce_deadline.is_none_or(|d| Instant::now() >= d)
+    }
 }
 
 fn parse_directory() -> Result<(u32, u32)> {
@@ -221,7 +234,7 @@ async fn watch_files(tx: mpsc::UnboundedSender<AppEvent>, year: u32, day: u32) -
         while (file_rx.recv().await).is_some() {
             let _ = tx.send(AppEvent::FileChanged);
             // Debounce: wait a bit to avoid multiple rapid triggers
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         drop(watcher);
     });
@@ -390,7 +403,7 @@ fn render_ui(
         }
 
         // Status bar
-        let status_text = vec![
+        let mut status_spans = vec![
             Span::styled(
                 format!("AoC {}/{} ", state.year, state.day),
                 Style::default()
@@ -422,16 +435,27 @@ fn render_ui(
                 Style::default().fg(Color::Yellow),
             ),
             Span::raw(" | "),
-            if state.running {
-                Span::styled(
-                    "RUNNING",
-                    Style::default()
-                        .fg(Color::LightRed)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                Span::styled("STOPPED", Style::default().fg(Color::Green))
-            },
+        ];
+
+        if state.pending_restart && state.debounce_deadline.is_some() {
+            status_spans.push(Span::styled(
+                "DEBOUNCING",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if state.running {
+            status_spans.push(Span::styled(
+                "RUNNING",
+                Style::default()
+                    .fg(Color::LightRed)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            status_spans.push(Span::styled("STOPPED", Style::default().fg(Color::Green)));
+        }
+
+        status_spans.extend([
             Span::raw(" | Time: "),
             Span::styled(
                 if let Some(duration) = state.elapsed_time() {
@@ -446,9 +470,9 @@ fn render_ui(
                 "[a/b] Part, [1-9] Sample data, [i] Puzzle data, [k] Kill, [q] Quit",
                 Style::default().fg(Color::DarkGray),
             ),
-        ];
+        ]);
 
-        let status = Paragraph::new(Line::from(status_text))
+        let status = Paragraph::new(Line::from(status_spans))
             .block(Block::default().borders(Borders::ALL).title(" Status "));
         f.render_widget(status, chunks[1]);
     })?;
@@ -474,13 +498,13 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Trigger initial run
-    let _ = tx.send(AppEvent::FileChanged);
+    let _ = tx.send(AppEvent::UserTriggeredRun);
 
     // Tick timer for UI updates when running
     let tx_tick = tx.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
             let _ = tx_tick.send(AppEvent::Tick);
         }
     });
@@ -492,11 +516,42 @@ async fn main() -> Result<()> {
             render_ui(&mut terminal, &mut state_guard)?;
         }
 
+        // Check if we should start a run
+        {
+            let state_guard = state.lock().unwrap();
+            if state_guard.should_start_run() {
+                drop(state_guard);
+
+                let mut state_guard = state.lock().unwrap();
+                state_guard.pending_restart = false;
+                state_guard.debounce_deadline = None;
+                state_guard.output_lines.clear();
+                state_guard.scroll_offset = 0;
+                state_guard.running = true;
+                state_guard.start_time = Some(Instant::now());
+                state_guard.end_time = None;
+                drop(state_guard);
+
+                let state_clone = state.clone();
+                let tx_clone = tx.clone();
+                tokio::spawn(async move {
+                    let _ = run_program(state_clone, tx_clone).await;
+                });
+            }
+        }
+
         // Handle events
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
         {
             let mut state_guard = state.lock().unwrap();
+
+            // Ignore user input during debounce period
+            if state_guard.debounce_deadline.is_some()
+                && !matches!(key.code, KeyCode::Char('q') | KeyCode::Char('k'))
+            {
+                continue;
+            }
 
             let delta = if key.modifiers.contains(KeyModifiers::CONTROL) {
                 50
@@ -510,21 +565,21 @@ async fn main() -> Result<()> {
                     if state_guard.part != Part::A {
                         state_guard.part = Part::A;
                         drop(state_guard);
-                        let _ = tx.send(AppEvent::FileChanged);
+                        let _ = tx.send(AppEvent::UserTriggeredRun);
                     }
                 }
                 KeyCode::Char('b') => {
                     if state_guard.part != Part::B {
                         state_guard.part = Part::B;
                         drop(state_guard);
-                        let _ = tx.send(AppEvent::FileChanged);
+                        let _ = tx.send(AppEvent::UserTriggeredRun);
                     }
                 }
                 KeyCode::Char('i') => {
                     if state_guard.input != Input::Main {
                         state_guard.input = Input::Main;
                         drop(state_guard);
-                        let _ = tx.send(AppEvent::FileChanged);
+                        let _ = tx.send(AppEvent::UserTriggeredRun);
                     }
                 }
                 KeyCode::Char(c @ '1'..='9') => {
@@ -532,11 +587,13 @@ async fn main() -> Result<()> {
                     if state_guard.input != Input::Ref(n) {
                         state_guard.input = Input::Ref(n);
                         drop(state_guard);
-                        let _ = tx.send(AppEvent::FileChanged);
+                        let _ = tx.send(AppEvent::UserTriggeredRun);
                     }
                 }
                 KeyCode::Char('k') => {
                     state_guard.kill_process();
+                    state_guard.pending_restart = false;
+                    state_guard.debounce_deadline = None;
                 }
                 KeyCode::Up => {
                     state_guard.scroll_offset = state_guard.scroll_offset.saturating_sub(delta);
@@ -580,21 +637,37 @@ async fn main() -> Result<()> {
         // Process async events
         while let Ok(event) = rx.try_recv() {
             match event {
-                AppEvent::FileChanged => {
+                AppEvent::FileChanged | AppEvent::UserTriggeredRun => {
                     let mut state_guard = state.lock().unwrap();
-                    state_guard.kill_process();
-                    state_guard.output_lines.clear();
-                    state_guard.scroll_offset = 0;
-                    state_guard.running = true;
-                    state_guard.start_time = Some(Instant::now());
-                    state_guard.end_time = None;
-                    drop(state_guard);
 
-                    let state_clone = state.clone();
+                    // If already pending, just reset the deadline
+                    if state_guard.pending_restart {
+                        let deadline = Instant::now() + Duration::from_millis(DEBOUNCE_MS);
+                        state_guard.debounce_deadline = Some(deadline);
+                        continue;
+                    }
+
+                    // Kill the current process if running
+                    if state_guard.running {
+                        state_guard.kill_process();
+                    }
+
+                    // Set up debounce period
+                    let deadline = Instant::now() + Duration::from_millis(DEBOUNCE_MS);
+                    state_guard.pending_restart = true;
+                    state_guard.debounce_deadline = Some(deadline);
+
+                    // Spawn task to send ProcessKilled after the process is confirmed killed
                     let tx_clone = tx.clone();
                     tokio::spawn(async move {
-                        let _ = run_program(state_clone, tx_clone).await;
+                        // Small delay to ensure kill completes
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        let _ = tx_clone.send(AppEvent::ProcessKilled);
                     });
+                }
+                AppEvent::ProcessKilled => {
+                    // Process has been killed, can now start if debounce is done
+                    // The main loop will check should_start_run()
                 }
                 AppEvent::OutputLine(color, line) => {
                     let mut state_guard = state.lock().unwrap();
@@ -609,7 +682,7 @@ async fn main() -> Result<()> {
                     state_guard.child_process = None;
                 }
                 AppEvent::Tick => {
-                    // Just triggers a redraw
+                    // Just triggers a redraw and check for pending runs
                 }
             }
         }
