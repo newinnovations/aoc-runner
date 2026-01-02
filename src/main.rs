@@ -29,7 +29,6 @@ const MAX_LINE_LENGTH: usize = 1000;
 const DEBOUNCE_MS: u64 = 100;
 const BATCH_SIZE: usize = 100;
 const MIN_RENDER_INTERVAL_MS: u64 = 16;
-const CHANNEL_CAPACITY: usize = 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Part {
@@ -211,7 +210,7 @@ fn parse_directory() -> Result<(u32, u32)> {
     Ok((year, day))
 }
 
-async fn watch_files(tx: mpsc::Sender<AppEvent>, year: u32, day: u32) -> Result<()> {
+async fn watch_files(tx: mpsc::UnboundedSender<AppEvent>, year: u32, day: u32) -> Result<()> {
     let (file_tx, mut file_rx) = mpsc::unbounded_channel();
 
     let file_tx_clone = file_tx.clone();
@@ -253,7 +252,7 @@ async fn watch_files(tx: mpsc::Sender<AppEvent>, year: u32, day: u32) -> Result<
 
     tokio::spawn(async move {
         while (file_rx.recv().await).is_some() {
-            let _ = tx.send(AppEvent::FileChanged).await;
+            let _ = tx.send(AppEvent::FileChanged);
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         drop(watcher);
@@ -264,7 +263,7 @@ async fn watch_files(tx: mpsc::Sender<AppEvent>, year: u32, day: u32) -> Result<
 
 async fn run_program(
     state: Arc<Mutex<AppState>>,
-    tx: mpsc::Sender<AppEvent>,
+    tx: mpsc::UnboundedSender<AppEvent>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let (prog_path, input_path) = {
@@ -273,24 +272,20 @@ async fn run_program(
     };
 
     if !prog_path.exists() {
-        let _ = tx
-            .send(AppEvent::OutputLine(
-                Color::LightRed,
-                format!("Error: Program '{}' not found", prog_path.display()),
-            ))
-            .await;
-        let _ = tx.send(AppEvent::ProcessFinished).await;
+        let _ = tx.send(AppEvent::OutputLine(
+            Color::LightRed,
+            format!("Error: Program '{}' not found", prog_path.display()),
+        ));
+        let _ = tx.send(AppEvent::ProcessFinished);
         return Ok(());
     }
 
     if !input_path.exists() {
-        let _ = tx
-            .send(AppEvent::OutputLine(
-                Color::LightRed,
-                format!("Error: Input file '{}' not found", input_path.display()),
-            ))
-            .await;
-        let _ = tx.send(AppEvent::ProcessFinished).await;
+        let _ = tx.send(AppEvent::OutputLine(
+            Color::LightRed,
+            format!("Error: Input file '{}' not found", input_path.display()),
+        ));
+        let _ = tx.send(AppEvent::ProcessFinished);
         return Ok(());
     }
 
@@ -323,7 +318,7 @@ async fn run_program(
             }
 
             if let Ok(line) = line {
-                let _ = tx_stdout.try_send(AppEvent::OutputLine(Color::White, line));
+                let _ = tx_stdout.send(AppEvent::OutputLine(Color::White, line));
             } else {
                 break;
             }
@@ -341,7 +336,7 @@ async fn run_program(
             }
 
             if let Ok(line) = line {
-                let _ = tx_stderr.try_send(AppEvent::OutputLine(
+                let _ = tx_stderr.send(AppEvent::OutputLine(
                     Color::LightRed,
                     format!("ERROR: {}", line),
                 ));
@@ -376,10 +371,10 @@ async fn run_program(
                         .unwrap_or_else(|| "unknown".to_string())
                 )
             };
-            let _ = tx.try_send(AppEvent::OutputLine(Color::DarkGray, String::new()));
-            let _ = tx.try_send(AppEvent::OutputLine(Color::DarkGray, msg));
+            let _ = tx.send(AppEvent::OutputLine(Color::DarkGray, String::new()));
+            let _ = tx.send(AppEvent::OutputLine(Color::DarkGray, msg));
         }
-        let _ = tx.send(AppEvent::ProcessFinished).await;
+        let _ = tx.send(AppEvent::ProcessFinished);
     });
 
     Ok(())
@@ -525,7 +520,7 @@ async fn main() -> Result<()> {
     let (year, day) = parse_directory().context("Failed to parse directory structure")?;
 
     let state = Arc::new(Mutex::new(AppState::new(year, day)));
-    let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let (tx, mut rx) = mpsc::unbounded_channel();
 
     watch_files(tx.clone(), year, day).await?;
 
@@ -535,13 +530,13 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let _ = tx.send(AppEvent::UserTriggeredRun).await;
+    let _ = tx.send(AppEvent::UserTriggeredRun);
 
     let tx_tick = tx.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let _ = tx_tick.send(AppEvent::Tick).await;
+            let _ = tx_tick.send(AppEvent::Tick);
         }
     });
 
@@ -612,7 +607,7 @@ async fn main() -> Result<()> {
                     if state_guard.part != Part::A {
                         state_guard.part = Part::A;
                         drop(state_guard);
-                        let _ = tx.send(AppEvent::UserTriggeredRun).await;
+                        let _ = tx.send(AppEvent::UserTriggeredRun);
                         needs_render = true;
                     }
                 }
@@ -620,7 +615,7 @@ async fn main() -> Result<()> {
                     if state_guard.part != Part::B {
                         state_guard.part = Part::B;
                         drop(state_guard);
-                        let _ = tx.send(AppEvent::UserTriggeredRun).await;
+                        let _ = tx.send(AppEvent::UserTriggeredRun);
                         needs_render = true;
                     }
                 }
@@ -628,7 +623,7 @@ async fn main() -> Result<()> {
                     if state_guard.input != Input::Main {
                         state_guard.input = Input::Main;
                         drop(state_guard);
-                        let _ = tx.send(AppEvent::UserTriggeredRun).await;
+                        let _ = tx.send(AppEvent::UserTriggeredRun);
                         needs_render = true;
                     }
                 }
@@ -637,7 +632,7 @@ async fn main() -> Result<()> {
                     if state_guard.input != Input::Ref(n) {
                         state_guard.input = Input::Ref(n);
                         drop(state_guard);
-                        let _ = tx.send(AppEvent::UserTriggeredRun).await;
+                        let _ = tx.send(AppEvent::UserTriggeredRun);
                         needs_render = true;
                     }
                 }
@@ -695,13 +690,11 @@ async fn main() -> Result<()> {
         }
 
         let mut batch = Vec::new();
-        let mut event_count = 0;
 
-        while let Ok(event) = rx.try_recv() {
-            match event {
-                AppEvent::OutputLine(color, line) => {
+        loop {
+            match rx.try_recv() {
+                Ok(AppEvent::OutputLine(color, line)) => {
                     batch.push((color, line));
-                    event_count += 1;
 
                     if batch.len() >= BATCH_SIZE {
                         let mut state_guard = state.lock().await;
@@ -714,7 +707,8 @@ async fn main() -> Result<()> {
                         needs_render = true;
                     }
                 }
-                other_event => {
+                Ok(other_event) => {
+                    // Always flush batch before processing other events
                     if !batch.is_empty() {
                         let mut state_guard = state.lock().await;
                         state_guard.add_output_lines_batch(batch);
@@ -732,7 +726,7 @@ async fn main() -> Result<()> {
                             if state_guard.pending_restart {
                                 let deadline = Instant::now() + Duration::from_millis(DEBOUNCE_MS);
                                 state_guard.debounce_deadline = Some(deadline);
-                                continue;
+                                break;
                             }
 
                             if state_guard.running {
@@ -746,32 +740,74 @@ async fn main() -> Result<()> {
                             let tx_clone = tx.clone();
                             tokio::spawn(async move {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
-                                let _ = tx_clone.send(AppEvent::ProcessKilled).await;
+                                let _ = tx_clone.send(AppEvent::ProcessKilled);
                             });
 
                             needs_render = true;
+                            break;
                         }
-                        AppEvent::ProcessKilled => {}
+                        AppEvent::ProcessKilled => {
+                            // Nothing to do here, batch already flushed above
+                        }
                         AppEvent::ProcessFinished => {
+                            // Drain ALL remaining OutputLine events from the channel
+                            let mut final_batch = Vec::new();
+                            loop {
+                                match rx.try_recv() {
+                                    Ok(AppEvent::OutputLine(color, line)) => {
+                                        final_batch.push((color, line));
+
+                                        // Flush in batches to avoid holding the lock too long
+                                        if final_batch.len() >= BATCH_SIZE {
+                                            let mut state_guard = state.lock().await;
+                                            state_guard.add_output_lines_batch(final_batch);
+                                            let viewport_height = state_guard.viewport_height;
+                                            state_guard.scroll_to_bottom(viewport_height);
+                                            drop(state_guard);
+                                            final_batch = Vec::new();
+                                        }
+                                    }
+                                    Ok(_) => {
+                                        // Got a non-OutputLine event, ignore it
+                                    }
+                                    Err(_) => {
+                                        // Channel is empty, we're done
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Flush any remaining items
+                            if !final_batch.is_empty() {
+                                let mut state_guard = state.lock().await;
+                                state_guard.add_output_lines_batch(final_batch);
+                                let viewport_height = state_guard.viewport_height;
+                                state_guard.scroll_to_bottom(viewport_height);
+                                drop(state_guard);
+                            }
+
                             let mut state_guard = state.lock().await;
                             state_guard.running = false;
                             state_guard.end_time = Some(Instant::now());
                             state_guard.child_process = None;
                             needs_render = true;
+                            break;
                         }
                         AppEvent::Tick => {
                             needs_render = true;
+                            break;
                         }
                         _ => {}
                     }
                 }
-            }
-
-            if event_count >= BATCH_SIZE * 2 {
-                break;
+                Err(_) => {
+                    // No more events available
+                    break;
+                }
             }
         }
 
+        // Final flush of any remaining batch items after event processing
         if !batch.is_empty() {
             let mut state_guard = state.lock().await;
             state_guard.add_output_lines_batch(batch);
