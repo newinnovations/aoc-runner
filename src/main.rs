@@ -26,6 +26,8 @@ use tokio::sync::mpsc;
 const MAX_LINES: usize = 1000;
 const MAX_LINE_LENGTH: usize = 1000;
 const DEBOUNCE_MS: u64 = 100;
+const BATCH_SIZE: usize = 100; // Process up to 100 lines at once
+const MIN_RENDER_INTERVAL_MS: u64 = 16; // ~60 FPS max
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Part {
@@ -64,6 +66,7 @@ struct AppState {
     start_time: Option<Instant>,
     end_time: Option<Instant>,
     child_process: Option<Child>,
+    last_render: Instant,
 }
 
 impl AppState {
@@ -83,6 +86,7 @@ impl AppState {
             start_time: None,
             end_time: None,
             child_process: None,
+            last_render: Instant::now(),
         }
     }
 
@@ -125,19 +129,27 @@ impl AppState {
         }
     }
 
-    fn add_output_line(&mut self, color: Color, line: String) {
-        let truncated = if line.len() > MAX_LINE_LENGTH {
-            line.chars().take(MAX_LINE_LENGTH).collect()
-        } else {
-            line
-        };
+    // Batch add multiple lines efficiently
+    fn add_output_lines_batch(&mut self, lines: Vec<(Color, String)>) {
+        let mut truncated_lines: Vec<(Color, String)> = lines
+            .into_iter()
+            .map(|(color, line)| {
+                let truncated = if line.len() > MAX_LINE_LENGTH {
+                    line.chars().take(MAX_LINE_LENGTH).collect()
+                } else {
+                    line
+                };
+                (color, truncated)
+            })
+            .collect();
 
-        self.output_lines.push((color, truncated));
+        self.output_lines.append(&mut truncated_lines);
+
+        // Trim excess lines
         if self.output_lines.len() > MAX_LINES {
-            self.output_lines.remove(0);
-            if self.scroll_offset > 0 {
-                self.scroll_offset -= 1;
-            }
+            let excess = self.output_lines.len() - MAX_LINES;
+            self.output_lines.drain(0..excess);
+            self.scroll_offset = self.scroll_offset.saturating_sub(excess);
         }
     }
 
@@ -164,6 +176,10 @@ impl AppState {
         self.pending_restart
             && !self.running
             && self.debounce_deadline.is_none_or(|d| Instant::now() >= d)
+    }
+
+    fn should_render(&self) -> bool {
+        self.last_render.elapsed() >= Duration::from_millis(MIN_RENDER_INTERVAL_MS)
     }
 }
 
@@ -477,6 +493,7 @@ fn render_ui(
         f.render_widget(status, chunks[1]);
     })?;
 
+    state.last_render = Instant::now();
     Ok(())
 }
 
@@ -509,11 +526,22 @@ async fn main() -> Result<()> {
         }
     });
 
+    let mut needs_render = true;
+
     // Main loop
     loop {
-        {
-            let mut state_guard = state.lock().unwrap();
-            render_ui(&mut terminal, &mut state_guard)?;
+        // Only render when needed and enough time has passed
+        if needs_render {
+            let should_render = {
+                let state_guard = state.lock().unwrap();
+                state_guard.should_render()
+            };
+
+            if should_render {
+                let mut state_guard = state.lock().unwrap();
+                render_ui(&mut terminal, &mut state_guard)?;
+                needs_render = false;
+            }
         }
 
         // Check if we should start a run
@@ -537,11 +565,13 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     let _ = run_program(state_clone, tx_clone).await;
                 });
+
+                needs_render = true;
             }
         }
 
-        // Handle events
-        if event::poll(Duration::from_millis(50))?
+        // Handle keyboard events
+        if event::poll(Duration::from_millis(10))?
             && let Event::Key(key) = event::read()?
         {
             let mut state_guard = state.lock().unwrap();
@@ -566,6 +596,7 @@ async fn main() -> Result<()> {
                         state_guard.part = Part::A;
                         drop(state_guard);
                         let _ = tx.send(AppEvent::UserTriggeredRun);
+                        needs_render = true;
                     }
                 }
                 KeyCode::Char('b') => {
@@ -573,6 +604,7 @@ async fn main() -> Result<()> {
                         state_guard.part = Part::B;
                         drop(state_guard);
                         let _ = tx.send(AppEvent::UserTriggeredRun);
+                        needs_render = true;
                     }
                 }
                 KeyCode::Char('i') => {
@@ -580,6 +612,7 @@ async fn main() -> Result<()> {
                         state_guard.input = Input::Main;
                         drop(state_guard);
                         let _ = tx.send(AppEvent::UserTriggeredRun);
+                        needs_render = true;
                     }
                 }
                 KeyCode::Char(c @ '1'..='9') => {
@@ -588,103 +621,159 @@ async fn main() -> Result<()> {
                         state_guard.input = Input::Ref(n);
                         drop(state_guard);
                         let _ = tx.send(AppEvent::UserTriggeredRun);
+                        needs_render = true;
                     }
                 }
                 KeyCode::Char('k') => {
                     state_guard.kill_process();
                     state_guard.pending_restart = false;
                     state_guard.debounce_deadline = None;
+                    needs_render = true;
                 }
                 KeyCode::Up => {
                     state_guard.scroll_offset = state_guard.scroll_offset.saturating_sub(delta);
+                    needs_render = true;
                 }
                 KeyCode::Down => {
                     let viewport_height = state_guard.viewport_height;
                     let max = state_guard.max_scroll_offset(viewport_height);
                     state_guard.scroll_offset = (state_guard.scroll_offset + delta).min(max);
+                    needs_render = true;
                 }
                 KeyCode::PageUp => {
                     let viewport_height = state_guard.viewport_height;
                     state_guard.scroll_offset =
                         state_guard.scroll_offset.saturating_sub(viewport_height);
+                    needs_render = true;
                 }
                 KeyCode::PageDown => {
                     let viewport_height = state_guard.viewport_height;
                     let max = state_guard.max_scroll_offset(viewport_height);
                     state_guard.scroll_offset =
                         (state_guard.scroll_offset + viewport_height).min(max);
+                    needs_render = true;
                 }
                 KeyCode::Left => {
                     state_guard.horizontal_scroll =
                         state_guard.horizontal_scroll.saturating_sub(delta);
+                    needs_render = true;
                 }
                 KeyCode::Right => {
                     state_guard.horizontal_scroll =
                         state_guard.horizontal_scroll.saturating_add(delta);
+                    needs_render = true;
                 }
                 KeyCode::Home => {
                     state_guard.scroll_offset = 0;
                     state_guard.horizontal_scroll = 0;
+                    needs_render = true;
                 }
                 KeyCode::End => {
                     let viewport_height = state_guard.viewport_height;
                     state_guard.scroll_to_bottom(viewport_height);
+                    needs_render = true;
                 }
                 _ => {}
             }
         }
 
-        // Process async events
+        // Process async events in batches
+        let mut batch = Vec::new();
+        let mut event_count = 0;
+
         while let Ok(event) = rx.try_recv() {
             match event {
-                AppEvent::FileChanged | AppEvent::UserTriggeredRun => {
-                    let mut state_guard = state.lock().unwrap();
-
-                    // If already pending, just reset the deadline
-                    if state_guard.pending_restart {
-                        let deadline = Instant::now() + Duration::from_millis(DEBOUNCE_MS);
-                        state_guard.debounce_deadline = Some(deadline);
-                        continue;
-                    }
-
-                    // Kill the current process if running
-                    if state_guard.running {
-                        state_guard.kill_process();
-                    }
-
-                    // Set up debounce period
-                    let deadline = Instant::now() + Duration::from_millis(DEBOUNCE_MS);
-                    state_guard.pending_restart = true;
-                    state_guard.debounce_deadline = Some(deadline);
-
-                    // Spawn task to send ProcessKilled after the process is confirmed killed
-                    let tx_clone = tx.clone();
-                    tokio::spawn(async move {
-                        // Small delay to ensure kill completes
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        let _ = tx_clone.send(AppEvent::ProcessKilled);
-                    });
-                }
-                AppEvent::ProcessKilled => {
-                    // Process has been killed, can now start if debounce is done
-                    // The main loop will check should_start_run()
-                }
                 AppEvent::OutputLine(color, line) => {
-                    let mut state_guard = state.lock().unwrap();
-                    state_guard.add_output_line(color, line);
-                    let viewport_height = state_guard.viewport_height;
-                    state_guard.scroll_to_bottom(viewport_height);
+                    batch.push((color, line));
+                    event_count += 1;
+
+                    // Process batch when it gets large enough
+                    if batch.len() >= BATCH_SIZE {
+                        let mut state_guard = state.lock().unwrap();
+                        state_guard.add_output_lines_batch(batch);
+                        let viewport_height = state_guard.viewport_height;
+                        state_guard.scroll_to_bottom(viewport_height);
+                        drop(state_guard);
+
+                        batch = Vec::new();
+                        needs_render = true;
+                    }
                 }
-                AppEvent::ProcessFinished => {
-                    let mut state_guard = state.lock().unwrap();
-                    state_guard.running = false;
-                    state_guard.end_time = Some(Instant::now());
-                    state_guard.child_process = None;
-                }
-                AppEvent::Tick => {
-                    // Just triggers a redraw and check for pending runs
+                other_event => {
+                    // Process any remaining batch before handling other events
+                    if !batch.is_empty() {
+                        let mut state_guard = state.lock().unwrap();
+                        state_guard.add_output_lines_batch(batch);
+                        let viewport_height = state_guard.viewport_height;
+                        state_guard.scroll_to_bottom(viewport_height);
+                        drop(state_guard);
+                        batch = Vec::new();
+                        needs_render = true;
+                    }
+
+                    match other_event {
+                        AppEvent::FileChanged | AppEvent::UserTriggeredRun => {
+                            let mut state_guard = state.lock().unwrap();
+
+                            // If already pending, just reset the deadline
+                            if state_guard.pending_restart {
+                                let deadline = Instant::now() + Duration::from_millis(DEBOUNCE_MS);
+                                state_guard.debounce_deadline = Some(deadline);
+                                continue;
+                            }
+
+                            // Kill the current process if running
+                            if state_guard.running {
+                                state_guard.kill_process();
+                            }
+
+                            // Set up debounce period
+                            let deadline = Instant::now() + Duration::from_millis(DEBOUNCE_MS);
+                            state_guard.pending_restart = true;
+                            state_guard.debounce_deadline = Some(deadline);
+
+                            // Spawn task to send ProcessKilled after the process is confirmed killed
+                            let tx_clone = tx.clone();
+                            tokio::spawn(async move {
+                                // Small delay to ensure kill completes
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                let _ = tx_clone.send(AppEvent::ProcessKilled);
+                            });
+
+                            needs_render = true;
+                        }
+                        AppEvent::ProcessKilled => {
+                            // Process has been killed, can now start if debounce is done
+                            // The main loop will check should_start_run()
+                        }
+                        AppEvent::ProcessFinished => {
+                            let mut state_guard = state.lock().unwrap();
+                            state_guard.running = false;
+                            state_guard.end_time = Some(Instant::now());
+                            state_guard.child_process = None;
+                            needs_render = true;
+                        }
+                        AppEvent::Tick => {
+                            needs_render = true;
+                        }
+                        _ => {}
+                    }
                 }
             }
+
+            // Limit how many events we process in one iteration
+            if event_count >= BATCH_SIZE * 2 {
+                break;
+            }
+        }
+
+        // Process any remaining batch
+        if !batch.is_empty() {
+            let mut state_guard = state.lock().unwrap();
+            state_guard.add_output_lines_batch(batch);
+            let viewport_height = state_guard.viewport_height;
+            state_guard.scroll_to_bottom(viewport_height);
+            needs_render = true;
         }
     }
 
