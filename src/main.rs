@@ -29,6 +29,7 @@ const MAX_LINE_LENGTH: usize = 1000;
 const DEBOUNCE_MS: u64 = 100;
 const BATCH_SIZE: usize = 100;
 const MIN_RENDER_INTERVAL_MS: u64 = 16;
+const BATCH_TIMEOUT_MS: u64 = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Part {
@@ -50,6 +51,7 @@ enum AppEvent {
     ProcessKilled,
     ProcessFinished,
     Tick,
+    FlushBatch, // New event to force batch flush
 }
 
 struct AppState {
@@ -292,6 +294,7 @@ async fn run_program(
     let input_file = std::fs::File::open(&input_path).context("Failed to open input file")?;
 
     let mut child = Command::new("python3")
+        .arg("-u")
         .arg(&prog_path)
         .stdin(Stdio::from(input_file))
         .stdout(Stdio::piped())
@@ -541,6 +544,8 @@ async fn main() -> Result<()> {
     });
 
     let mut needs_render = true;
+    let mut batch: Vec<(Color, String)> = Vec::new();
+    let mut flush_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         if needs_render {
@@ -689,13 +694,17 @@ async fn main() -> Result<()> {
             }
         }
 
-        let mut batch = Vec::new();
-
         loop {
             match rx.try_recv() {
                 Ok(AppEvent::OutputLine(color, line)) => {
+                    // Cancel any pending flush timer since we're adding to the batch
+                    if let Some(handle) = flush_handle.take() {
+                        handle.abort();
+                    }
+
                     batch.push((color, line));
 
+                    // If batch is full, flush immediately
                     if batch.len() >= BATCH_SIZE {
                         let mut state_guard = state.lock().await;
                         state_guard.add_output_lines_batch(batch);
@@ -705,11 +714,34 @@ async fn main() -> Result<()> {
 
                         batch = Vec::new();
                         needs_render = true;
+                    } else {
+                        // Schedule a flush after timeout
+                        let tx_flush = tx.clone();
+                        flush_handle = Some(tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(BATCH_TIMEOUT_MS)).await;
+                            let _ = tx_flush.send(AppEvent::FlushBatch);
+                        }));
                     }
+                }
+                Ok(AppEvent::FlushBatch) => {
+                    // Flush any pending batch
+                    if !batch.is_empty() {
+                        let mut state_guard = state.lock().await;
+                        state_guard.add_output_lines_batch(batch);
+                        let viewport_height = state_guard.viewport_height;
+                        state_guard.scroll_to_bottom(viewport_height);
+                        drop(state_guard);
+                        batch = Vec::new();
+                        needs_render = true;
+                    }
+                    flush_handle = None;
                 }
                 Ok(other_event) => {
                     // Always flush batch before processing other events
                     if !batch.is_empty() {
+                        if let Some(handle) = flush_handle.take() {
+                            handle.abort();
+                        }
                         let mut state_guard = state.lock().await;
                         state_guard.add_output_lines_batch(batch);
                         let viewport_height = state_guard.viewport_height;
@@ -809,10 +841,14 @@ async fn main() -> Result<()> {
 
         // Final flush of any remaining batch items after event processing
         if !batch.is_empty() {
+            if let Some(handle) = flush_handle.take() {
+                handle.abort();
+            }
             let mut state_guard = state.lock().await;
             state_guard.add_output_lines_batch(batch);
             let viewport_height = state_guard.viewport_height;
             state_guard.scroll_to_bottom(viewport_height);
+            batch = Vec::new();
             needs_render = true;
         }
     }
