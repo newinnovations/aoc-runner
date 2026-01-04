@@ -1,5 +1,7 @@
 # AoC Runner – Live TUI runner for Advent of Code
 
+*Basically I currently have no idea how this all works, but it works like a charm. Code is by Claude with several improvements and review cycles initiated by me, documentation below is by Grok. Enjoy.*
+
 A lightweight, terminal-based watcher and runner for Advent of Code (AoC) Python solutions. It automatically detects changes to your solution files or sample inputs, kills any running process, and immediately re-runs the appropriate script with the selected input. Output is displayed in a scrollable TUI with live timing and status information.
 
 Perfect for rapid iteration during AoC – edit your code or samples and see results instantly.
