@@ -24,7 +24,7 @@ use std::{
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-const MAX_LINES: usize = 1000;
+const MAX_LINES: usize = 2000;
 const MAX_LINE_LENGTH: usize = 1000;
 const DEBOUNCE_MS: u64 = 100;
 const BATCH_SIZE: usize = 100;
